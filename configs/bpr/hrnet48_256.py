@@ -1,21 +1,32 @@
 import os
+
+# DATA_ROOT environment variable points to your dataset root (or set manually).
 _data_root = os.environ.get('DATA_ROOT')
+
+# tidy namespace
 del os
 
+# Inherit runtime and schedule defaults from base configs.
 _base_ = [
     '../_base_/default_runtime.py', 
     '../_base_/schedules/schedule_160k.py'
 ]
 
-# model settings
+# Model settings (backbone + decode head). Uses SyncBN for multi-GPU training.
 norm_cfg = dict(type='SyncBN', requires_grad=True)
 model = dict(
+    # Encoder-decoder model that accepts a coarse mask for refinement.
     type='EncoderDecoderRefine',
+    # Pretrained HRNet weights from the OpenMMLab model zoo for faster
+    # convergence (optional).
     pretrained='open-mmlab://msra/hrnetv2_w48',
     backbone=dict(
+        # HRNet-based backbone configured to W48-like widths.
         type='HRNetRefine',
         norm_cfg=norm_cfg,
+        # Keep BN in train mode (norm_eval=False).
         norm_eval=False,
+        # `extra` sets stage/branch/block/channel details (HRNet-W48).
         extra=dict(
             stage1=dict(
                 num_modules=1,
@@ -42,35 +53,43 @@ model = dict(
                 num_blocks=(4, 4, 4, 4),
                 num_channels=(48, 96, 192, 384)))),
     decode_head=dict(
+    # Light-weight FCN head that concat-resizes branch outputs.
         type='FCNHead',
         in_channels=[48, 96, 192, 384],
         in_index=(0, 1, 2, 3),
+    # `channels` equals the concatenated channel dimension of branches.
         channels=sum([48, 96, 192, 384]),
         input_transform='resize_concat',
         kernel_size=1,
         num_convs=1,
         concat_input=False,
-        dropout_ratio=-1,
-        num_classes=2,
+        dropout_ratio=-1,  # disable dropout
+        num_classes=2,     # binary segmentation
         norm_cfg=norm_cfg,
         align_corners=False,
+        # CrossEntropyLoss (softmax). For single-channel binary, use sigmoid.
         loss_decode=dict(
             type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0)))
-# model training and testing settings
+# Training/testing behavior. `mode='whole'` runs full-image inference.
 train_cfg = dict()
 test_cfg = dict(mode='whole')
 
-# dataset settings
+# Dataset settings. `RefineDataset` should provide 'coarse_mask' with each sample.
 dataset_type = 'RefineDataset'
 data_root = _data_root
-img_norm_cfg = dict(
-    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+# Image normalization settings.
+img_norm_cfg = dict(mean=[123.675, 116.28, 103.53],
+                    std=[58.395, 57.12, 57.375], to_rgb=True)
 
+# Fixed input size (256x256) and data pipelines for train/val/test.
 crop_size = (256, 256)
+
+# Training pipeline: loads image, gt, and coarse mask; applies augmentations.
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations'),
     dict(type='LoadCoarseMask'),
+    # Fixed resize; no random scaling.
     dict(type='Resize', img_scale=crop_size, ratio_range=(1.0, 1.0)),
     dict(type='RandomFlip', flip_ratio=0.5),
     dict(type='PhotoMetricDistortion'),
@@ -78,6 +97,7 @@ train_pipeline = [
     dict(type='DefaultFormatBundle'),
     dict(type='Collect', keys=['img', 'gt_semantic_seg', 'coarse_mask']),
 ]
+# Test/validation pipeline (single-scale, no flip).
 test_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations'),
@@ -86,6 +106,7 @@ test_pipeline = [
         type='MultiScaleFlipAug',
         img_scale=crop_size,
         flip=False,
+        #flip_direction=['horizontal', 'vertical'],
         transforms=[
             dict(type='Resize', img_scale=crop_size, keep_ratio=True),
             dict(type='RandomFlip'),
@@ -95,8 +116,8 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=8,
-    workers_per_gpu=8,
+    samples_per_gpu=24,
+    workers_per_gpu=4,
     train=dict(
         type=dataset_type,
         data_root=data_root,

@@ -15,9 +15,32 @@ from mmseg.datasets import build_dataset
 from mmseg.models import build_segmentor
 from mmseg.utils import collect_env, get_root_logger
 
+# PowerShell examples — how to run this training script from Windows PowerShell
+#
+# Single-GPU (non-distributed):
+#   PS> python tools/train.py configs/bpr/hrnet48_256.py --gpus 1 --work-dir work_dirs/hrnet48_256
+#   or specify a GPU id:
+#   PS> python tools/train.py configs/bpr/hrnet48_256.py --gpu-ids 0 --work-dir work_dirs/hrnet48_256
+#
+# Multi-GPU (single node) — recommended using torch.distributed.run (torchrun):
+#   PS> python -m torch.distributed.run --nproc_per_node=4 tools/train.py \
+#       configs/bpr/hrnet48_256.py --launcher pytorch --work-dir work_dirs/hrnet48_256
+#
+# Alternative (older launcher):
+#   PS> python -m torch.distributed.launch --nproc_per_node=4 tools/train.py \
+#       configs/bpr/hrnet48_256.py --launcher pytorch --work-dir work_dirs/hrnet48_256
+#
+# Notes:
+# - Replace 4 with the number of GPUs you want to use.
+# - Set environment variables in PowerShell like:
+#     PS> $env:DATA_ROOT = 'C:\path\to\dataset'
+# - On multi-GPU runs ensure CUDA and PyTorch distributed support are available.
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a segmentor')
+    # CLI arguments: config path is required, others are optional flags to
+    # override behavior (work dir, checkpoint load/resume, GPU settings).
     parser.add_argument('config', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
@@ -64,6 +87,8 @@ def main():
     args = parse_args()
 
     cfg = Config.fromfile(args.config)
+    # Load config file (MMCV/ MMseg style). You can override fields via
+    # --options on the command line; merged options will update cfg.
     if args.options is not None:
         cfg.merge_from_dict(args.options)
     # set cudnn_benchmark
@@ -93,6 +118,9 @@ def main():
     else:
         distributed = True
         init_dist(args.launcher, **cfg.dist_params)
+    # Distributed training (multi-node / multi-process) is initialized here
+    # when launcher != 'none'. For single-node single-process training leave
+    # launcher as 'none'.
 
     # create work_dir
     mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
@@ -133,6 +161,8 @@ def main():
     logger.info(model)
 
     datasets = [build_dataset(cfg.data.train)]
+    # Build train (and optionally val) datasets. If workflow includes validation,
+    # we create a val dataset using the train pipeline (common in MMseg configs).
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)
         val_dataset.pipeline = cfg.data.train.pipeline
@@ -155,6 +185,9 @@ def main():
         validate=(not args.no_validate),
         timestamp=timestamp,
         meta=meta)
+
+    # train_segmentor starts the training loop. It handles epochs, logging,
+    # checkpointing and optional validation according to cfg.
 
 
 if __name__ == '__main__':
