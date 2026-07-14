@@ -18,11 +18,18 @@ train_pipeline = [
     dict(type='Collect', keys=['img', 'gt_semantic_seg', 'coarse_mask']),
 ]
 
+# Override SyncBN (inherited from hrnet48_256.py) with plain BN. SyncBN
+# requires a distributed process group and crashes non-distributed / single-GPU
+# runs; the polyp baseline (poly_hrnet48_256.py) uses BN.
+norm_cfg = dict(type='BN', requires_grad=True)
+
 model = dict(
     type='EncoderDecoderRefineFCT',
     fct_weight=0.3,       # back to original since no longer competing with flip aug
     fct_warmup_iters=300,
     fct_use_vflip=True,
+    backbone=dict(norm_cfg=norm_cfg),
+    decode_head=dict(norm_cfg=norm_cfg),
 )
 
 data = dict(

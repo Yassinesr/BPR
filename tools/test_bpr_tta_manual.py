@@ -81,8 +81,10 @@ def preprocess(img_bgr, coarse_gray, crop_size):
     # Normalize image
     img_resized = (img_resized - IMG_MEAN) / IMG_STD
 
-    # Binarize coarse mask -> {0, 1}
-    coarse_bin = (coarse_resized > 127).astype(np.float32)
+    # Binarize coarse mask -> {0, 1}. Match training's LoadCoarseMask, which
+    # binarizes with `> 0` (any nonzero pixel is foreground); using a >127
+    # midpoint here would be a train/test mismatch for non-binary coarse masks.
+    coarse_bin = (coarse_resized > 0).astype(np.float32)
 
     # To tensors
     img_t = torch.from_numpy(img_resized).permute(2, 0, 1).unsqueeze(0).cuda()
@@ -104,15 +106,16 @@ def single_view_prob(model, img, coarse, img_meta, use_coarse_mask):
         x = torch.cat([img, coarse_normalized[:, None, ...]], dim=1)
     else:
         x = img
-    # inference() is defined in the parent EncoderDecoder class and returns
-    # the full seg_logit of shape (1, num_classes, H, W).
-    seg_logit = model.module.inference(x, [img_meta], rescale=False)
-    if seg_logit.shape[1] == 1:
-        # Single-channel logit, use sigmoid
-        prob = torch.sigmoid(seg_logit)
+    # inference() (parent EncoderDecoder) ALREADY applies F.softmax and returns
+    # per-class PROBABILITIES of shape (1, num_classes, H, W) -- not logits.
+    # Do NOT softmax again: a second softmax squashes probs toward 0.5 (a true
+    # 0.9 -> ~0.69) and corrupts the multi-view TTA average. Take the
+    # foreground channel directly.
+    prob_map = model.module.inference(x, [img_meta], rescale=False)
+    if prob_map.shape[1] == 1:
+        prob = prob_map                     # single-channel (already a prob)
     else:
-        # Multi-class, take class 1 prob via softmax
-        prob = F.softmax(seg_logit, dim=1)[:, 1:2]
+        prob = prob_map[:, 1:2]             # foreground-class probability
     return prob
 
 

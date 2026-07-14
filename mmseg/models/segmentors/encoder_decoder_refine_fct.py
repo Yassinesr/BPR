@@ -7,6 +7,7 @@ the model's predictions to match across flipped views (after un-flipping).
 import torch
 import torch.nn.functional as F
 
+from mmseg.core import add_prefix
 from mmseg.models.builder import SEGMENTORS
 from .encoder_decoder_refine import EncoderDecoderRefine
 
@@ -52,12 +53,17 @@ class EncoderDecoderRefineFCT(EncoderDecoderRefine):
         self.fct_weight = float(fct_weight)
         self.fct_warmup_iters = int(fct_warmup_iters)
         self.fct_use_vflip = bool(fct_use_vflip)
-        self._fct_iter = 0
+        # Registered as a buffer so the warmup counter is saved in the model
+        # state_dict and restored on resume-from. A plain int would reset to 0
+        # and replay the (short) warmup ramp after every resume, briefly
+        # under-weighting the consistency loss.
+        self.register_buffer('_fct_iter', torch.zeros((), dtype=torch.long))
 
     def _current_fct_weight(self):
-        if self.fct_warmup_iters <= 0 or self._fct_iter >= self.fct_warmup_iters:
+        it = int(self._fct_iter)
+        if self.fct_warmup_iters <= 0 or it >= self.fct_warmup_iters:
             return self.fct_weight
-        return self.fct_weight * (self._fct_iter / float(self.fct_warmup_iters))
+        return self.fct_weight * (it / float(self.fct_warmup_iters))
 
     def forward_train(self, img, img_metas, gt_semantic_seg, coarse_mask):
         B = img.shape[0]
@@ -92,20 +98,25 @@ class EncoderDecoderRefineFCT(EncoderDecoderRefine):
 
         features = self.extract_feat(x_in)
 
+        # Single decode-head forward, reused for BOTH the supervised loss and
+        # the consistency term. Calling _decode_head_forward_train and then
+        # _decode_head_forward_test would run the head twice on identical
+        # features, doubling the head's BatchNorm running-stat updates per
+        # iteration (and wasting compute/activation memory).
+        seg_logits_raw = self.decode_head(features)
+
         losses = dict()
-        loss_decode = self._decode_head_forward_train(
-            features, metas_all, gt_all)
-        losses.update(loss_decode)
+        losses.update(add_prefix(
+            self.decode_head.losses(seg_logits_raw, gt_all), 'decode'))
 
         if self.with_auxiliary_head:
             loss_aux = self._auxiliary_head_forward_train(
                 features, metas_all, gt_all)
             losses.update(loss_aux)
 
-        # ----- Flip-consistency loss -----
-        seg_logits = self._decode_head_forward_test(features, metas_all)
+        # ----- Flip-consistency loss (from the same logits) -----
         seg_logits = F.interpolate(
-            seg_logits, size=img.shape[-2:],
+            seg_logits_raw, size=img.shape[-2:],
             mode='bilinear', align_corners=self.align_corners)
 
         if seg_logits.shape[1] >= 2:

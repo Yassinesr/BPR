@@ -20,9 +20,11 @@ model = dict(
     decode_head=dict(norm_cfg=norm_cfg),
 )
 
-# Reduce batch size because FCT internally triples each batch.
-# hrnet48_256.py uses samples_per_gpu=24. We drop to 8 so the
-# effective tripled-batch size is 24 (same compute as the baseline).
+# Reduce batch size to compensate for FCT's internal batch expansion.
+# NOTE: fct_use_vflip=False above, so each batch is DOUBLED (orig + H-flip),
+# not tripled. hrnet48_256.py uses samples_per_gpu=24, so with samples_per_gpu=8
+# the effective per-iter batch is 16 (< the 24 baseline). Use samples_per_gpu=12
+# for true compute parity at 2x, or set fct_use_vflip=True (3x) with 8.
 data = dict(samples_per_gpu=8)
 
 # Keep all other settings from the base config (optimizer, schedule,
