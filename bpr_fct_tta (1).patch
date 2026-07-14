@@ -1,0 +1,325 @@
+diff --git a/configs/bpr/hrnet48_256_fct.py b/configs/bpr/hrnet48_256_fct.py
+index 5540cddb2f..b8c5442070 100644
+--- a/configs/bpr/hrnet48_256_fct.py
++++ b/configs/bpr/hrnet48_256_fct.py
+@@ -20,9 +20,11 @@ model = dict(
+     decode_head=dict(norm_cfg=norm_cfg),
+ )
+ 
+-# Reduce batch size because FCT internally triples each batch.
+-# hrnet48_256.py uses samples_per_gpu=24. We drop to 8 so the
+-# effective tripled-batch size is 24 (same compute as the baseline).
++# Reduce batch size to compensate for FCT's internal batch expansion.
++# NOTE: fct_use_vflip=False above, so each batch is DOUBLED (orig + H-flip),
++# not tripled. hrnet48_256.py uses samples_per_gpu=24, so with samples_per_gpu=8
++# the effective per-iter batch is 16 (< the 24 baseline). Use samples_per_gpu=12
++# for true compute parity at 2x, or set fct_use_vflip=True (3x) with 8.
+ data = dict(samples_per_gpu=8)
+ 
+ # Keep all other settings from the base config (optimizer, schedule,
+diff --git a/configs/bpr/hrnet48_256_fct_noflip.py b/configs/bpr/hrnet48_256_fct_noflip.py
+index 186f9dfa87..1b3e6441b2 100644
+--- a/configs/bpr/hrnet48_256_fct_noflip.py
++++ b/configs/bpr/hrnet48_256_fct_noflip.py
+@@ -18,11 +18,18 @@ train_pipeline = [
+     dict(type='Collect', keys=['img', 'gt_semantic_seg', 'coarse_mask']),
+ ]
+ 
++# Override SyncBN (inherited from hrnet48_256.py) with plain BN. SyncBN
++# requires a distributed process group and crashes non-distributed / single-GPU
++# runs; the polyp baseline (poly_hrnet48_256.py) uses BN.
++norm_cfg = dict(type='BN', requires_grad=True)
++
+ model = dict(
+     type='EncoderDecoderRefineFCT',
+     fct_weight=0.3,       # back to original since no longer competing with flip aug
+     fct_warmup_iters=300,
+     fct_use_vflip=True,
++    backbone=dict(norm_cfg=norm_cfg),
++    decode_head=dict(norm_cfg=norm_cfg),
+ )
+ 
+ data = dict(
+diff --git a/configs/bpr/poly_hrnet48_256_fct.py b/configs/bpr/poly_hrnet48_256_fct.py
+new file mode 100644
+index 0000000000..9b832a0e0d
+--- /dev/null
++++ b/configs/bpr/poly_hrnet48_256_fct.py
+@@ -0,0 +1,82 @@
++"""BPR HRNet-48 + Flip-Consistency Training (FCT), wired to the POLYP task.
++
++Unlike configs/bpr/hrnet48_256_fct.py -- which inherits the *general*
++hrnet48_256.py (SyncBN, PhotoMetricDistortion, a 160k-iter/16k-eval schedule,
++and a flip=True eval pipeline) -- this config inherits the polyp-specific
++poly_hrnet48_256.py, so FCT actually applies to the polyp benchmark:
++  - BN (single-GPU friendly), the 50k-iter / 2.5k-eval schedule,
++  - RefineDataset + PraNet coarse masks via the DATA_ROOT env var.
++
++It only overrides:
++  1. the segmentor -> EncoderDecoderRefineFCT (+ FCT hyperparameters),
++  2. samples_per_gpu, reduced so per-iter compute stays close to the baseline
++     under FCT's internal batch expansion, and
++  3. the val/test pipeline -> flip=False (single view).
++
++Why (3): the poly base test pipeline uses MultiScaleFlipAug(flip=True), which
++routes evaluation through the segmentor's aug_test(). EncoderDecoderRefine only
++implements simple_test(img, img_meta, coarse_mask); the inherited
++EncoderDecoder.aug_test(imgs, img_metas, rescale) has NO coarse_mask parameter,
++so in-training evaluation would raise `TypeError: aug_test() got an unexpected
++keyword argument 'coarse_mask'`. Forcing flip=False makes num_augs==1, which
++routes evaluation through simple_test (correct). Real test-time 4-view TTA is
++done separately and correctly by tools/test_bpr_tta_manual.py.
++
++Train:
++  python tools/train_poly.py configs/bpr/poly_hrnet48_256_fct.py \
++      --gpus 1 --work-dir work_dirs/poly_hrnet48_256_fct
++  (set DATA_ROOT to your RefineDataset patch root first)
++Test-time TTA:
++  bash run_bpr_tta_eval.sh   # uses tools/test_bpr_tta_manual.py
++"""
++
++_base_ = ['./poly_hrnet48_256.py']
++
++# The poly base already uses BN; restate for clarity/robustness.
++norm_cfg = dict(type='BN', requires_grad=True)
++
++model = dict(
++    type='EncoderDecoderRefineFCT',
++    # ----- FCT hyperparameters (tunable) -----
++    # Peak weight of the consistency (MSE) loss.
++    fct_weight=0.05,
++    # Linear ramp 0 -> fct_weight over the first N iters (short warmup).
++    fct_warmup_iters=300,
++    # Polyps are invariant to vertical flip, and the test-time TTA averages
++    # H/V/HV views, so enforcing vertical consistency at train time matches
++    # inference. Set False to only use H-flip (2x batch instead of 3x).
++    fct_use_vflip=True,
++    backbone=dict(norm_cfg=norm_cfg),
++    decode_head=dict(norm_cfg=norm_cfg),
++)
++
++# ----- Evaluation pipeline: single view (flip=False) -----
++# See the module docstring for why flip=True would crash aug_test().
++img_norm_cfg = dict(mean=[123.675, 116.28, 103.53],
++                    std=[58.395, 57.12, 57.375], to_rgb=True)
++crop_size = (256, 256)
++test_pipeline = [
++    dict(type='LoadImageFromFile'),
++    dict(type='LoadAnnotations'),
++    dict(type='LoadCoarseMask'),
++    dict(
++        type='MultiScaleFlipAug',
++        img_scale=crop_size,
++        flip=False,
++        transforms=[
++            dict(type='Resize', img_scale=crop_size, keep_ratio=True),
++            dict(type='RandomFlip'),
++            dict(type='Normalize', **img_norm_cfg),
++            dict(type='ImageToTensor', keys=['img']),
++            dict(type='Collect', keys=['img', 'coarse_mask']),
++        ])
++]
++
++# FCT with fct_use_vflip=True triples each batch internally (orig + H + V).
++# The poly base uses samples_per_gpu=16; drop to 6 so the effective per-iter
++# batch (~18) stays close to the baseline. Use 8 if fct_use_vflip=False (2x).
++data = dict(
++    samples_per_gpu=6,
++    val=dict(pipeline=test_pipeline),
++    test=dict(pipeline=test_pipeline),
++)
+diff --git a/mmseg/models/segmentors/__init__.py b/mmseg/models/segmentors/__init__.py
+index 94d534efe8..cd9abb7f1f 100644
+--- a/mmseg/models/segmentors/__init__.py
++++ b/mmseg/models/segmentors/__init__.py
+@@ -3,4 +3,7 @@ from .encoder_decoder import EncoderDecoder
+ from .encoder_decoder_refine import EncoderDecoderRefine
+ from .encoder_decoder_refine_fct import EncoderDecoderRefineFCT
+ 
+-__all__ = ['EncoderDecoder', 'CascadeEncoderDecoder', 'EncoderDecoderRefine']
++__all__ = [
++    'EncoderDecoder', 'CascadeEncoderDecoder', 'EncoderDecoderRefine',
++    'EncoderDecoderRefineFCT'
++]
+diff --git a/mmseg/models/segmentors/encoder_decoder_refine_fct.py b/mmseg/models/segmentors/encoder_decoder_refine_fct.py
+index 76dbb3bd69..868d0e3be3 100644
+--- a/mmseg/models/segmentors/encoder_decoder_refine_fct.py
++++ b/mmseg/models/segmentors/encoder_decoder_refine_fct.py
+@@ -7,6 +7,7 @@ the model's predictions to match across flipped views (after un-flipping).
+ import torch
+ import torch.nn.functional as F
+ 
++from mmseg.core import add_prefix
+ from mmseg.models.builder import SEGMENTORS
+ from .encoder_decoder_refine import EncoderDecoderRefine
+ 
+@@ -52,12 +53,17 @@ class EncoderDecoderRefineFCT(EncoderDecoderRefine):
+         self.fct_weight = float(fct_weight)
+         self.fct_warmup_iters = int(fct_warmup_iters)
+         self.fct_use_vflip = bool(fct_use_vflip)
+-        self._fct_iter = 0
++        # Registered as a buffer so the warmup counter is saved in the model
++        # state_dict and restored on resume-from. A plain int would reset to 0
++        # and replay the (short) warmup ramp after every resume, briefly
++        # under-weighting the consistency loss.
++        self.register_buffer('_fct_iter', torch.zeros((), dtype=torch.long))
+ 
+     def _current_fct_weight(self):
+-        if self.fct_warmup_iters <= 0 or self._fct_iter >= self.fct_warmup_iters:
++        it = int(self._fct_iter)
++        if self.fct_warmup_iters <= 0 or it >= self.fct_warmup_iters:
+             return self.fct_weight
+-        return self.fct_weight * (self._fct_iter / float(self.fct_warmup_iters))
++        return self.fct_weight * (it / float(self.fct_warmup_iters))
+ 
+     def forward_train(self, img, img_metas, gt_semantic_seg, coarse_mask):
+         B = img.shape[0]
+@@ -92,20 +98,25 @@ class EncoderDecoderRefineFCT(EncoderDecoderRefine):
+ 
+         features = self.extract_feat(x_in)
+ 
++        # Single decode-head forward, reused for BOTH the supervised loss and
++        # the consistency term. Calling _decode_head_forward_train and then
++        # _decode_head_forward_test would run the head twice on identical
++        # features, doubling the head's BatchNorm running-stat updates per
++        # iteration (and wasting compute/activation memory).
++        seg_logits_raw = self.decode_head(features)
++
+         losses = dict()
+-        loss_decode = self._decode_head_forward_train(
+-            features, metas_all, gt_all)
+-        losses.update(loss_decode)
++        losses.update(add_prefix(
++            self.decode_head.losses(seg_logits_raw, gt_all), 'decode'))
+ 
+         if self.with_auxiliary_head:
+             loss_aux = self._auxiliary_head_forward_train(
+                 features, metas_all, gt_all)
+             losses.update(loss_aux)
+ 
+-        # ----- Flip-consistency loss -----
+-        seg_logits = self._decode_head_forward_test(features, metas_all)
++        # ----- Flip-consistency loss (from the same logits) -----
+         seg_logits = F.interpolate(
+-            seg_logits, size=img.shape[-2:],
++            seg_logits_raw, size=img.shape[-2:],
+             mode='bilinear', align_corners=self.align_corners)
+ 
+         if seg_logits.shape[1] >= 2:
+diff --git a/run_bpr_tta_eval.sh b/run_bpr_tta_eval.sh
+index e0271ff74a..bd147d7b2f 100755
+--- a/run_bpr_tta_eval.sh
++++ b/run_bpr_tta_eval.sh
+@@ -1,33 +1,42 @@
+ #!/bin/bash
++# 4-view flip TTA evaluation for BPR on the 5 polyp test sets.
++#
++# This delegates to tools/test_bpr_tta_manual.py, which performs the ACTUAL
++# test-time augmentation (identity + H-flip + V-flip + HV-flip, each un-flipped
++# and averaged in probability space). The previous version of this script
++# called tools/test.py with configs/bpr/hrnet48_256.py, whose test pipeline has
++# flip=False -> it performed NO TTA (and --show-dir only writes visualizations,
++# not the binary masks needed for Dice/IoU scoring).
++#
++# The manual tool loops over the datasets internally and expects, per dataset:
++#   <TEST_ROOT>/<dataset>/images/         RGB inputs
++#   <TEST_ROOT>/<dataset>/pranet_masks/   coarse (PraNet) masks to refine
++# and writes refined binary PNGs to <OUT_ROOT>/<dataset>/.
++#
++# Override any of these via environment variables.
+ set -e
+ 
+-CONFIG=configs/bpr/hrnet48_256.py
+-CHECKPOINT=work_dirs/hrnet48_256/latest.pth
+-OUTPUT_BASE=results_cl/BPR_TTA
+-
+-DATA_ROOT_BASE=~/projects/BPR/dataset/TestDataset_bpr_layout
+-DATASETS=("Kvasir" "CVC-ClinicDB" "CVC-ColonDB" "CVC-300" "ETIS-LaribPolypDB")
+-
+-mkdir -p "$OUTPUT_BASE"
+-
+-for DS in "${DATASETS[@]}"; do
+-    echo ""
+-    echo "=========================================="
+-    echo "  Running BPR + TTA on $DS"
+-    echo "=========================================="
+-
+-    export DATA_ROOT="$DATA_ROOT_BASE/$DS"
+-
+-    OUT_DIR="$OUTPUT_BASE/$DS"
+-    mkdir -p "$OUT_DIR"
+-
+-    python tools/test.py "$CONFIG" "$CHECKPOINT" \
+-        --show-dir "$OUT_DIR" \
+-        --options data.test.data_root="$DATA_ROOT"
+-
+-    echo "Predictions saved to $OUT_DIR"
+-done
++CONFIG=${CONFIG:-configs/bpr/poly_hrnet48_256_fct.py}
++CHECKPOINT=${CHECKPOINT:-work_dirs/poly_hrnet48_256_fct/latest.pth}
++TEST_ROOT=${TEST_ROOT:-dataset/TestDataset_bpr_layout}
++OUT_ROOT=${OUT_ROOT:-results_cl/BPR_TTA}
++
++echo "=========================================="
++echo "  BPR 4-view TTA"
++echo "  config     : $CONFIG"
++echo "  checkpoint : $CHECKPOINT"
++echo "  test root  : $TEST_ROOT"
++echo "  out root   : $OUT_ROOT"
++echo "=========================================="
++
++python tools/test_bpr_tta_manual.py \
++    --config "$CONFIG" \
++    --checkpoint "$CHECKPOINT" \
++    --test-root "$TEST_ROOT" \
++    --out-root "$OUT_ROOT"
+ 
+ echo ""
+-echo "All BPR+TTA predictions saved under $OUTPUT_BASE"
+-echo "Now run your existing eval script on this folder."
++echo "TTA-refined masks saved under $OUT_ROOT (per-dataset subfolders)."
++echo "Now run your polyp eval script (Dice/IoU vs GT) on that folder."
++echo "Tip: pass --no-tta to tools/test_bpr_tta_manual.py to compare against the"
++echo "single-view (no-TTA) baseline."
+diff --git a/tools/test_bpr_tta_manual.py b/tools/test_bpr_tta_manual.py
+index cd638d842d..c16adaeaa6 100644
+--- a/tools/test_bpr_tta_manual.py
++++ b/tools/test_bpr_tta_manual.py
+@@ -81,8 +81,10 @@ def preprocess(img_bgr, coarse_gray, crop_size):
+     # Normalize image
+     img_resized = (img_resized - IMG_MEAN) / IMG_STD
+ 
+-    # Binarize coarse mask -> {0, 1}
+-    coarse_bin = (coarse_resized > 127).astype(np.float32)
++    # Binarize coarse mask -> {0, 1}. Match training's LoadCoarseMask, which
++    # binarizes with `> 0` (any nonzero pixel is foreground); using a >127
++    # midpoint here would be a train/test mismatch for non-binary coarse masks.
++    coarse_bin = (coarse_resized > 0).astype(np.float32)
+ 
+     # To tensors
+     img_t = torch.from_numpy(img_resized).permute(2, 0, 1).unsqueeze(0).cuda()
+@@ -104,15 +106,16 @@ def single_view_prob(model, img, coarse, img_meta, use_coarse_mask):
+         x = torch.cat([img, coarse_normalized[:, None, ...]], dim=1)
+     else:
+         x = img
+-    # inference() is defined in the parent EncoderDecoder class and returns
+-    # the full seg_logit of shape (1, num_classes, H, W).
+-    seg_logit = model.module.inference(x, [img_meta], rescale=False)
+-    if seg_logit.shape[1] == 1:
+-        # Single-channel logit, use sigmoid
+-        prob = torch.sigmoid(seg_logit)
++    # inference() (parent EncoderDecoder) ALREADY applies F.softmax and returns
++    # per-class PROBABILITIES of shape (1, num_classes, H, W) -- not logits.
++    # Do NOT softmax again: a second softmax squashes probs toward 0.5 (a true
++    # 0.9 -> ~0.69) and corrupts the multi-view TTA average. Take the
++    # foreground channel directly.
++    prob_map = model.module.inference(x, [img_meta], rescale=False)
++    if prob_map.shape[1] == 1:
++        prob = prob_map                     # single-channel (already a prob)
+     else:
+-        # Multi-class, take class 1 prob via softmax
+-        prob = F.softmax(seg_logit, dim=1)[:, 1:2]
++        prob = prob_map[:, 1:2]             # foreground-class probability
+     return prob
+ 
+ 
